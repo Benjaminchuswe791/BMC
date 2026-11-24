@@ -15,8 +15,8 @@ const origins = (process.env.CLIENT_ORIGINS || "")
 app.use(cors({ origin: origins }));
 app.use(express.json());
 
-const STUDENT_NUMBER = "202504791";
-const STUDENT_NAME = "Benjamin Chuswe";
+const STUDENT_NUMBER = process.env.STUDENT_NUMBER || "202504791";
+const STUDENT_NAME = process.env.STUDENT_NAME || "Benjamin Chuswe";
 const SITE_TITLE = "Activity7-Backend for ICT 251";
 
 function esc(text) {
@@ -97,7 +97,8 @@ footer{text-align:center;color:var(--muted);padding:1.5rem 1rem;border-top:1px s
 <tr><td>PUT</td><td>Updated record, same id</td><td>200</td></tr>
 <tr><td>DELETE</td><td>{"message":"Record deleted."}</td><td>200</td></tr></table>
 <p>Errors return <code>{"message": "..."}</code>: <strong>400</strong> invalid input, invalid id or malformed JSON;
-<strong>404</strong> record or route not found; <strong>500</strong> unexpected server error; <strong>503</strong> health check cannot reach the database.</p>
+<strong>404</strong> record or route not found; <strong>413</strong> request body too large;
+<strong>500</strong> unexpected server error; <strong>503</strong> health check cannot query the records table.</p>
 </main>
 <footer>${esc(SITE_TITLE)} &middot; ${esc(STUDENT_NAME)} &middot; ${esc(STUDENT_NUMBER)} &middot; made-up data only</footer>
 </body></html>`);
@@ -106,7 +107,7 @@ footer{text-align:center;color:var(--muted);padding:1.5rem 1rem;border-top:1px s
 // GET /health : server and database check
 app.get("/health", async (req, res) => {
   try {
-    await pool.query("SELECT 1");
+    await pool.query("SELECT id, title, category, description, status FROM records LIMIT 0");
     res.status(200).json({ status: "ok", database: "connected" });
   } catch (error) {
     console.error("Health check failed:", error.message);
@@ -127,24 +128,44 @@ app.use((error, req, res, next) => {
   if (error.type === "entity.parse.failed" || error instanceof SyntaxError) {
     return res.status(400).json({ message: "Malformed JSON in request body." });
   }
+  if (error.type === "entity.too.large") {
+    return res.status(413).json({ message: "Request body is too large." });
+  }
   console.error(error);
   res.status(500).json({ message: "Unexpected server error. Please try again." });
 });
 
 // Create the table and insert the starting records once, only when the table does not exist yet.
 async function initDatabase() {
-  const exists = await pool.query("SELECT to_regclass('public.records') AS name");
-  if (exists.rows[0].name === null) {
-    await pool.query(fs.readFileSync(path.join(__dirname, "schema.sql"), "utf8"));
-    await pool.query(fs.readFileSync(path.join(__dirname, "seed.sql"), "utf8"));
-    console.log("Created records table and inserted starting records.");
-  } else {
-    await pool.query(fs.readFileSync(path.join(__dirname, "schema.sql"), "utf8"));
+  const client = await pool.connect();
+  let rollbackError;
+  try {
+    await client.query("BEGIN");
+    // Serialize setup if two instances start against the same database.
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('activity7-backend.records'))");
+    const exists = await client.query("SELECT to_regclass('records') AS name");
+    if (exists.rows[0].name === null) {
+      await client.query(fs.readFileSync(path.join(__dirname, "schema.sql"), "utf8"));
+      await client.query(fs.readFileSync(path.join(__dirname, "seed.sql"), "utf8"));
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (failedRollback) {
+      rollbackError = failedRollback;
+    }
+    throw error;
+  } finally {
+    client.release(rollbackError);
   }
 }
 
 const port = process.env.PORT || 3000;
-app.listen(port, "0.0.0.0", () => {
-  console.log(`Server listening on port ${port}`);
-  initDatabase().catch((error) => console.error("Database setup failed:", error.message));
+initDatabase().then(() => {
+  app.listen(port, "0.0.0.0", () => console.log(`Server listening on port ${port}`));
+}).catch(async (error) => {
+  console.error("Database setup failed:", error.message);
+  process.exitCode = 1;
+  await pool.end();
 });
